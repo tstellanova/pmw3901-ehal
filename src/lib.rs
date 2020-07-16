@@ -15,6 +15,7 @@ use embedded_hal::blocking::delay::DelayMs;
 
 #[cfg(feature = "rttdebug")]
 use panic_rtt_core::rprintln;
+use core::f32::consts::PI;
 
 /// Errors in this crate
 #[derive(Debug)]
@@ -37,6 +38,8 @@ pub struct PMW3901<SPI, CSN> {
     spi: SPI,
     /// the Chip Select pin (GPIO output) to use when communicating
     csn: CSN,
+
+    prior_pixel_flow: (i16, i16)
 }
 
 impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
@@ -46,9 +49,8 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         CSN: OutputPin<Error = PinE>,
 {
 
-
     pub fn new(spi: SPI, csn: CSN) -> Self {
-        let mut inst = Self { spi: spi, csn: csn };
+        let mut inst = Self { spi: spi, csn: csn, prior_pixel_flow: (0, 0) };
         //ensure that the device is initially deselected
         let _ = inst.csn.set_high();
         inst
@@ -89,7 +91,7 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         Self::DIR_READ & (Register::Squal as u8), 0
     ];
 
-    /// Main method for obtaining the (dx, dy) flow
+    /// For obtaining the raw pixel (dx, dy) flow
     pub fn get_motion(&mut self) -> Result< (i16, i16), Error<CommE, PinE>> {
         //read the motion block all at once
         let mut block: [u8; 12] = Self::MOTION_READ_BLOCK;
@@ -105,6 +107,32 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         let dy = ((block[9] as i16) << 8) | (block[7] as i16);
 
         Ok((dx, dy))
+    }
+
+    /// Maximum pixel flow
+    const MAX_FLOW_PIX: i16 = 240;
+    /// Maximum flow in radians/second, per datasheet:
+    const MAX_FLOW_RAD_SEC: f32 = 7.4;
+
+    /// Sensor effective viewing angle in degrees
+    const VIEW_ANGLE_DEGS: f32 = 42.0;
+    const VIEW_ANGLE_RADS: f32 = (VIEW_ANGLE_DEGS* PI)/180.0;
+
+    /// Get the current flow estimate in radians
+    pub fn get_flow_radians(&mut self) -> Result< (f32, f32), Error<CommE, PinE>>
+    {
+        let (xpix, ypix) = self.get_motion()?;
+        let xrads = if xpix <= 240 && xpix >= -240 {
+            xpix / 500.0f32
+        } else {
+            Self::MAX_FLOW_RADS
+        };
+
+        let yrads = if ypix <= 240 && ypix >= -240 {
+
+        } else {
+            Self::MAX_FLOW_RADS
+        };
     }
 
     /// Read a single register's value
