@@ -1,12 +1,20 @@
+/*
+Copyright (c) 2020 Todd Stellanova
+LICENSE: BSD3 (see LICENSE file)
+*/
 
 #![no_std]
 
-
+//!
+//! An embedded-hal no-std driver for the PMW3901 optical flow sensor.
+//!
 
 use embedded_hal as hal;
 use hal::digital::v2::OutputPin;
 use embedded_hal::blocking::delay::DelayMs;
 
+#[cfg(feature = "rttdebug")]
+use panic_rtt_core::rprintln;
 
 /// Errors in this crate
 #[derive(Debug)]
@@ -16,6 +24,8 @@ pub enum Error<CommE, PinE> {
     /// Pin setting error
     Pin(PinE),
 
+    /// Poor signal quality / insufficient light or texture
+    NoSignal,
     /// Unrecognized chip ID
     UnknownChipId,
     /// Sensor not responding
@@ -35,8 +45,7 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         + hal::blocking::spi::Transfer<u8, Error = CommE>,
         CSN: OutputPin<Error = PinE>,
 {
-    /// Combined with register address for reading single byte register
-    const DIR_READ: u8 = 0x80; // same as 1<<7  // TODO necessary?
+
 
     pub fn new(spi: SPI, csn: CSN) -> Self {
         let mut inst = Self { spi: spi, csn: csn };
@@ -46,43 +55,63 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
     }
 
     /// Initialize this device
-    pub fn init(&mut self, delay_source: &mut impl DelayMs<u8>) -> Result<(), Error<CommE, PinE>> {
+    pub fn init(&mut self, delay_source: &mut impl DelayMs<u32>) -> Result<(), Error<CommE, PinE>> {
         //perform a soft reset
-        self.register_write(Registers::PowerUpReset as u8, 0x5A)?;
-
-        delay_source.delay_ms(3);
+        self.register_write(Register::PowerUpReset as u8, 0x5A)?;
+        delay_source.delay_ms(3000);
 
         // verify chip IDs
-        let cid = self.register_read(Registers::ProductId)?;
-        let inv_cid = self.register_read(Registers::InverseProductId)?;
+        let cid = self.register_read(Register::ProductId)?;
+        let inv_cid = self.register_read(Register::InverseProductId)?;
 
-        if !(0x49 == cid && 0xB8 == inv_cid) {
+        if !(Self::PRODUCT_ID == cid && Self::INV_PRODUCT_ID == inv_cid) {
+            #[cfg(feature = "rttdebug")]
+            rprintln!("unknown cid 0x{:x} inv_cid 0x{:x} ", cid, inv_cid);
             return Err(Error::UnknownChipId);
         }
 
-        self.write_optimization_registers()?;
+        self.write_config_optimizations()?;
+        // send an initial to the sensor: this is allowed to fail (squal == 0)
+        let _ = self.get_motion();
 
         Ok(())
     }
 
+    /// Below this threshold we assume the quality of flow measurement is poor
+    const SQUAL_THRESHOLD: u8 = 5;
+    const DIR_READ: u8 = 0x7f;
+    const MOTION_READ_BLOCK: [u8; 12] = [
+        Self::DIR_READ & (Register::Motion as u8), 0,
+        Self::DIR_READ & (Register::DeltaXL as u8), 0,
+        Self::DIR_READ & (Register::DeltaXH as u8), 0,
+        Self::DIR_READ & (Register::DeltaYL as u8), 0,
+        Self::DIR_READ & (Register::DeltaYH as u8), 0,
+        Self::DIR_READ & (Register::Squal as u8), 0
+    ];
+
+    /// Main method for obtaining the (dx, dy) flow
     pub fn get_motion(&mut self) -> Result< (i16, i16), Error<CommE, PinE>> {
-        //read the motion block in one swoop
-        let mut block: [u8; 5] = [0; 5];
-        // TODO verify that this sensor supports block reads
-        self.read_block(Registers::Motion, &mut block)?;
-        let dx = ((block[2] as u16) << 8) | (block[1] as u16);
-        let dy = ((block[4] as u16) << 8) | (block[3] as u16);
-        //TODO verify sign conversion is as expected
-        Ok((dx as i16, dy as i16))
+        //read the motion block all at once
+        let mut block: [u8; 12] = Self::MOTION_READ_BLOCK;
+        self.transfer_sequence(&mut block)?;
+        #[cfg(feature = "rttdebug")]
+        rprintln!("block: {:?}", block);
+
+        let squal = block[11];
+        if squal < Self::SQUAL_THRESHOLD {
+            return Err(Error::NoSignal);
+        }
+        let dx = ((block[5] as i16) << 8) | (block[3] as i16);
+        let dy = ((block[9] as i16) << 8) | (block[7] as i16);
+
+        Ok((dx, dy))
     }
 
     /// Read a single register's value
-    pub fn register_read(&mut self, reg: Registers) -> Result<u8, Error<CommE, PinE>> {
-        let mut block: [u8; 2] = [0; 2];
-        self.read_block(reg, &mut block)?;
-        #[cfg(feature = "rttdebug")]
-        rprintln!("read reg 0x{:x} {:x?} ", reg, block[1]);
-
+    pub fn register_read(&mut self, reg: Register) -> Result<u8, Error<CommE, PinE>> {
+        let mut block: [u8; 2] = [reg as u8, 0];
+        self.transfer_sequence(&mut block)?;
+        // self.read_block(reg, &mut block)?;
         Ok(block[1])
     }
 
@@ -93,9 +122,8 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         Ok(())
     }
 
-    /// Read enough data to fill a provided buffer
-    pub fn read_block(&mut self, reg: Registers, buffer: &mut [u8]) -> Result<(), Error<CommE, PinE>> {
-        buffer[0] = reg as u8 | Self::DIR_READ;
+    /// transfer a series of bytes to the sensor
+    fn transfer_sequence(&mut self,  buffer: &mut [u8]) -> Result<(), Error<CommE, PinE>> {
         self.csn.set_low().map_err(Error::Pin)?;
         let rc = self.spi.transfer(buffer);
         self.csn.set_high().map_err(Error::Pin)?;
@@ -117,9 +145,9 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
         Ok(())
     }
 
-    /// Write a sequence to optimization registers to optimize performance,
-    /// as advised by the datasheet.
-    fn write_optimization_registers(&mut self) -> Result<(), Error<CommE, PinE>> {
+    /// Write a sequence to undocumented registers in order to optimize performance,
+    /// as advised by datasheet section 8.2.
+    fn write_config_optimizations(&mut self) -> Result<(), Error<CommE, PinE>> {
         self.register_write(0x7F, 0x00)?;
         self.register_write(0x61, 0xAD)?;
         self.register_write(0x7F, 0x03)?;
@@ -138,10 +166,17 @@ impl<SPI, CSN, CommE, PinE> PMW3901<SPI, CSN>
 
         Ok(())
     }
+
+    /// supported product IDs
+    const PRODUCT_ID: u8 = 0x49;
+    const INV_PRODUCT_ID: u8  = 0xB6;
 }
 
+
+
 #[repr(u8)]
-pub enum Registers {
+#[derive(Copy, Clone, Debug)]
+pub enum Register {
     ProductId = 0x00,
     RevisionId = 0x01,
     Motion = 0x02,
@@ -167,10 +202,4 @@ pub enum Registers {
     InverseProductId = 0x5F,
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+

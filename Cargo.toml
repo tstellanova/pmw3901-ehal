@@ -3,6 +3,21 @@ name = "pmw3901-ehal"
 version = "0.1.0"
 authors = ["Todd Stellanova <tstellanova@users.noreply.github.com>"]
 edition = "2018"
+description = "PMW3901 optical flow driver for embedded-hal no_std applications"
+license = "BSD-3-Clause"
+repository = "https://github.com/tstellanova/pwm3901-ehal"
+categories = [
+    "embedded",
+    "hardware-support",
+    "no-std",
+]
+keywords = [
+    "embedded-hal-driver",
+    "pmw3901",
+    "optical-flow",
+    "gnc"
+]
+readme = "README.md"
 
 [dependencies]
 embedded-hal = { version = "0.2.4", features = ["unproven"] }
